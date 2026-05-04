@@ -24,14 +24,23 @@ from torch.nn.utils import stateless
 from torch.utils.hooks import RemovableHandle
 
 
+
 def sep(x: torch.Tensor) -> torch.Tensor:
+    '''
+    Identity function that serves as a separator for make_fx to divide the forward and backward pass of the training step.
+    '''
+    
     return x
 
 
 def sep_backward(grad: torch.Tensor) -> torch.Tensor:
+    '''
+    Identity function that serves as a separator for make_fx to divide the forward and backward pass of the training step.
+    '''
+    
     return grad
 
-
+## register the sep and sep_backward as real Aten operators
 separator_lib = torch.library.Library("separator", "DEF")
 separator_lib.define("sep(Tensor x) -> Tensor")
 separator_lib.impl("sep", sep, "CompositeExplicitAutograd")
@@ -57,6 +66,9 @@ DTensor._op_dispatcher.sharding_propagator.register_sharding_prop_rule(torch.ops
 
 
 class SEPFunction(torch.autograd.Function):
+    '''
+    a class for pytorch's autograd engine to trace throught the forward and backward pass of the separtor op.
+    '''
     @staticmethod
     def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
         return torch.ops.separator.sep(x)
@@ -184,6 +196,8 @@ class _CompiledResult:
 
 
 def _compile(func: Callable, *args: Any, **kwargs: Any):
+    
+    ## uses the makefx library to trace the training step function and extract the graph module.
     # 1. Extract nn.Module and Optimizer from args and kwargs
     mod, opt = None, None
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
