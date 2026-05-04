@@ -149,22 +149,17 @@ def select_activations_to_recompute(
                       if _alive_and_useful(n, s["lifetime"])]
         print(f"  [μ-TWO] {len(candidates)} eligible after peak filter")
 
-    # ── Step 2b: shallow-recompute filter. Reject activations whose
-    # producer needs other (still-live) candidates as inputs — those would
-    # require recomputing chains, ballooning backward memory. We want
-    # recomputation to be a single op whose inputs are already retained
-    # (placeholders or non-candidate nodes).
-    candidate_names_set = {n for n, _ in candidates}
-
+    # ── Step 2b: shallow-recompute filter. Strict version — the activation's
+    # producer must have ONLY placeholders as inputs. Placeholders (params,
+    # buffers, batch input) are always alive throughout the iteration, so
+    # recomputing is guaranteed to be a single op with no chain to walk.
     def _is_shallow(act_name: str) -> bool:
         node = name_to_node.get(act_name)
         if node is None:
             return False
         for inp in node.all_input_nodes:
-            if inp.op == "placeholder":
-                continue
-            if inp.name in candidate_names_set:
-                return False    # input would need recomputation too
+            if inp.op != "placeholder":
+                return False
         return True
 
     candidates = [(n, s) for n, s in candidates if _is_shallow(n)]
