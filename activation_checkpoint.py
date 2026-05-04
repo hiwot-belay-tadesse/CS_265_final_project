@@ -149,6 +149,27 @@ def select_activations_to_recompute(
                       if _alive_and_useful(n, s["lifetime"])]
         print(f"  [μ-TWO] {len(candidates)} eligible after peak filter")
 
+    # ── Step 2b: shallow-recompute filter. Reject activations whose
+    # producer needs other (still-live) candidates as inputs — those would
+    # require recomputing chains, ballooning backward memory. We want
+    # recomputation to be a single op whose inputs are already retained
+    # (placeholders or non-candidate nodes).
+    candidate_names_set = {n for n, _ in candidates}
+
+    def _is_shallow(act_name: str) -> bool:
+        node = name_to_node.get(act_name)
+        if node is None:
+            return False
+        for inp in node.all_input_nodes:
+            if inp.op == "placeholder":
+                continue
+            if inp.name in candidate_names_set:
+                return False    # input would need recomputation too
+        return True
+
+    candidates = [(n, s) for n, s in candidates if _is_shallow(n)]
+    print(f"  [μ-TWO] {len(candidates)} eligible after shallow filter")
+
     # ── Step 3: per-tensor cost analysis ───────────────────────────────
     chain_cache: Dict[str, float] = {}
     enriched: list[tuple[str, dict, str, float]] = []  # (name, stat, action, cost_ms)

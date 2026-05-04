@@ -264,11 +264,13 @@ def build_bert_experiment(device_str: str, batch_size: int | None) -> Experiment
     quirks). Default batch_size=8 if not overridden.
     """
     batch_size = 8 if batch_size is None else batch_size
-    seq_len = 128
+    # bert-base-sized config — gives activations enough mass to make AC
+    # meaningful at GPU-scale batches.
+    seq_len = 512
     vocab_size = 30_522
-    hidden_dim = 128
-    layers = 2
-    heads = 4
+    hidden_dim = 768
+    layers = 12
+    heads = 12
     num_classes = 2
 
     model = TinyBertClassifier(
