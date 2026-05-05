@@ -162,6 +162,14 @@ def select_activations_to_recompute(
     #      exceeds the original peak. So require:
     #        max(size of any intermediate in the chain) ≤ size of the act.
     def _chain_feasible(act_name: str) -> bool:
+        """Recomputation is only worthwhile if no point during the recompute
+        chain has more bytes alive than the target activation we're saving.
+
+        At any moment during recomputation, the live set is: (a) all inputs
+        to the *currently-executing* op + (b) intermediates already produced
+        but not yet consumed. Conservatively bound this by the **sum of all
+        non-boundary intermediates** in the chain.
+        """
         target = name_to_node.get(act_name)
         if target is None:
             return False
@@ -180,29 +188,28 @@ def select_activations_to_recompute(
         # BFS the dependency chain up to placeholders or surviving nodes
         seen: set = set()
         frontier: list = [target]
+        chain_intermediate_bytes = 0
         while frontier:
             node = frontier.pop()
             if node.name in seen:
                 continue
             seen.add(node.name)
 
-            # Boundary check
             if node is target:
-                pass  # always recurse from target
+                pass    # walk into target's inputs
             else:
-                # If this node is alive at recompute_point, treat as boundary
                 inp_lifetime = stats.get(node.name, {}).get("lifetime")
                 if inp_lifetime is not None and \
                    inp_lifetime[0] <= recompute_point <= inp_lifetime[1]:
                     continue
-                # If placeholder, also boundary
                 if node.op == "placeholder":
                     continue
-                # Otherwise it'd need to be re-executed — peak-shift check
-                inp_size = stats.get(node.name, {}).get("size_bytes", 0)
-                if inp_size > target_size:
-                    return False    # this intermediate is too big
-                # Continue walking back through this node's inputs
+                # This intermediate is going to be re-allocated during
+                # recompute. Add to the running tally.
+                chain_intermediate_bytes += stats.get(node.name, {}).get(
+                    "size_bytes", 0)
+                if chain_intermediate_bytes > target_size:
+                    return False    # cumulative cost exceeds savings
             for prev in node.all_input_nodes:
                 frontier.append(prev)
         return True
