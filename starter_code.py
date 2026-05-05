@@ -238,16 +238,66 @@ def make_graph_transformation(
         # ── Pass 2: profile WITH AC ────────────────────────────────────
         profiler_ac = GraphProfiler(gm)
         peak_ac, lat_ac = _profile(profiler_ac, args)
-        print(f"  peak_no_ac: {peak_no_ac/1024**2:.1f} MB")
-        print(f"  peak_ac:    {peak_ac/1024**2:.1f} MB")
-        print(f"  delta:      {(peak_no_ac - peak_ac)/1024**2:.1f} MB")
+        print(f"  peak_no_ac (allocator):  {peak_no_ac/1024**2:.1f} MB")
+        print(f"  peak_ac    (allocator):  {peak_ac/1024**2:.1f} MB")
+        print(f"  delta      (allocator):  {(peak_no_ac - peak_ac)/1024**2:.1f} MB")
+        # Simulated peak (timeline-based) — independent of allocator noise.
+        sim_no = profiler_no_ac.training_peak_memory
+        sim_ac = profiler_ac.training_peak_memory
+        print(f"  peak_no_ac (simulated):  {sim_no/1024**2:.1f} MB "
+              f"@ step {profiler_no_ac.training_peak_step}")
+        print(f"  peak_ac    (simulated):  {sim_ac/1024**2:.1f} MB "
+              f"@ step {profiler_ac.training_peak_step}")
+        print(f"  delta      (simulated):  {(sim_no - sim_ac)/1024**2:.1f} MB")
 
-        # Did the simulation actually shorten lifetimes? Print before/after
-        # for each selected activation.
+        # Per-activation forensic: did each selected node's lifetime actually
+        # shrink? Was it alive at the no-AC peak? Is it still alive at the
+        # AC peak after the rewrite? This pins down whether the rewriter is
+        # the culprit (lifetime unchanged) or the selector is (lifetime
+        # shrank but didn't cover peak).
+        peak_no_step = profiler_no_ac.training_peak_step
+        peak_ac_step = profiler_ac.training_peak_step
+
+        # Diff: which ACTs became alive at peak that weren't before?
+        def _alive_acts(prof, step):
+            return {
+                n: (s["lifetime"], s["size_bytes"])
+                for n, s in prof.stats.items()
+                if s["type"] == "ACT" and s["lifetime"][0] <= step <= s["lifetime"][1]
+            }
+        no_alive = _alive_acts(profiler_no_ac, peak_no_step)
+        ac_alive = _alive_acts(profiler_ac, peak_ac_step)
+        new_alive = set(ac_alive) - set(no_alive)
+        gone = set(no_alive) - set(ac_alive)
+        extended = {n for n in set(ac_alive) & set(no_alive)
+                    if ac_alive[n][0] != no_alive[n][0]}
+        print(f"  new alive @ peak ({len(new_alive)}):")
+        for n in sorted(new_alive)[:15]:
+            life, sz = ac_alive[n]
+            print(f"    +{n} life={life} size_MB={sz/1024**2:.2f}")
+        print(f"  gone @ peak ({len(gone)}):")
+        for n in sorted(gone)[:15]:
+            life, sz = no_alive[n]
+            print(f"    -{n} life={life} size_MB={sz/1024**2:.2f}")
+        print(f"  lifetime-changed but still alive ({len(extended)}):")
+        for n in sorted(extended)[:15]:
+            print(f"    ~{n}: {no_alive[n][0]} → {ac_alive[n][0]}")
+        print(f"  {'name':<30} {'old_life':<14} {'new_life':<14} "
+              f"{'@no_ac_pk':<10} {'@ac_pk':<8} {'size_MB':<8}")
         for act_name in nodes_to_recompute:
-            old = profiler_no_ac.stats.get(act_name, {}).get("lifetime")
-            new = profiler_ac.stats.get(act_name, {}).get("lifetime")
-            print(f"  [lifetime] {act_name}: {old} → {new}")
+            old_stat = profiler_no_ac.stats.get(act_name, {})
+            new_stat = profiler_ac.stats.get(act_name, {})
+            old = old_stat.get("lifetime")
+            new = new_stat.get("lifetime")
+            size_mb = old_stat.get("size_bytes", 0) / 1024**2
+            alive_no = (old is not None
+                        and old[0] <= peak_no_step <= old[1])
+            alive_ac = (new is not None
+                        and new[0] <= peak_ac_step <= new[1])
+            old_str = f"{old[0]}-{old[1]}" if old else "MISSING"
+            new_str = f"{new[0]}-{new[1]}" if new else "ERASED"
+            print(f"  {act_name:<30} {old_str:<14} {new_str:<14} "
+                  f"{str(alive_no):<10} {str(alive_ac):<8} {size_mb:<8.2f}")
 
         # Guard: if the rewrite increased peak, the recomputation chain cost
         # more than the activations saved. Honest fallback: report baseline.

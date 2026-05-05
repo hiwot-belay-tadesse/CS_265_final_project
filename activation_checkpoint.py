@@ -1,4 +1,5 @@
 import inspect
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.fx as fx
@@ -149,27 +150,15 @@ def select_activations_to_recompute(
                       if _alive_and_useful(n, s["lifetime"])]
         print(f"  [μ-TWO] {len(candidates)} eligible after peak filter")
 
-    # ── Step 2b: chain-aware feasibility filter.
-    # Two conditions, tested per candidate via a BFS up the graph:
-    #   1. Boundary reachability — the chain back from the activation must
-    #      terminate at placeholders or at intermediates still alive at the
-    #      recomputation point. If an intermediate is dead by then, our
-    #      rewriter can't recover it.
-    #   2. Peak-shift safety — every intermediate node copied into the
-    #      recompute block has its own brief allocation. If any of those
-    #      intermediates is *bigger* than the activation we're freeing, the
-    #      simulation will find a new peak inside the recompute block that
-    #      exceeds the original peak. So require:
-    #        max(size of any intermediate in the chain) ≤ size of the act.
+    # ── Step 2b: chain-reachability filter.
+    # The recompute chain must terminate at placeholders or at intermediates
+    # still alive at the recomputation point — otherwise the rewriter has
+    # nothing to start from. We do *not* try to bound the recompute spike
+    # statically here; μ-TWO trusts the post-pick greedy/re-simulation step
+    # to verify the new peak. The size check we used to do (single op or
+    # cumulative bytes ≤ target_size) was too strict — at deep BERT layers,
+    # any chain with more than a couple of ops would fail it.
     def _chain_feasible(act_name: str) -> bool:
-        """Recomputation is only worthwhile if no point during the recompute
-        chain has more bytes alive than the target activation we're saving.
-
-        At any moment during recomputation, the live set is: (a) all inputs
-        to the *currently-executing* op + (b) intermediates already produced
-        but not yet consumed. Conservatively bound this by the **sum of all
-        non-boundary intermediates** in the chain.
-        """
         target = name_to_node.get(act_name)
         if target is None:
             return False
@@ -185,10 +174,11 @@ def select_activations_to_recompute(
             return False
         recompute_point = min(bwd_user_idxs)
 
-        # BFS the dependency chain up to placeholders or surviving nodes
+        # BFS up to placeholders or to surviving intermediates. As long as
+        # every leaf of the BFS terminates at one of those, the recompute
+        # subgraph is constructible.
         seen: set = set()
         frontier: list = [target]
-        chain_intermediate_bytes = 0
         while frontier:
             node = frontier.pop()
             if node.name in seen:
@@ -204,18 +194,34 @@ def select_activations_to_recompute(
                     continue
                 if node.op == "placeholder":
                     continue
-                # This intermediate is going to be re-allocated during
-                # recompute. Add to the running tally.
-                chain_intermediate_bytes += stats.get(node.name, {}).get(
-                    "size_bytes", 0)
-                if chain_intermediate_bytes > target_size:
-                    return False    # cumulative cost exceeds savings
             for prev in node.all_input_nodes:
                 frontier.append(prev)
         return True
 
     candidates = [(n, s) for n, s in candidates if _chain_feasible(n)]
     print(f"  [μ-TWO] {len(candidates)} eligible after chain-feasibility filter")
+
+    # Boundary helper used later for re-simulation. Mirrors the rewriter's
+    # _compute_recompute_inputs assuming all other selected acts will also be
+    # recomputed (worst-case boundary).
+    def _rewriter_boundary(act_name: str, recompute_set: set) -> set:
+        target = name_to_node.get(act_name)
+        if target is None:
+            return set()
+        boundary: set = set()
+        seen: set = set()
+        frontier: list = [target]
+        while frontier:
+            node = frontier.pop()
+            for inp in node.all_input_nodes:
+                if inp.name in seen:
+                    continue
+                seen.add(inp.name)
+                if inp.op == "placeholder" or inp.name not in recompute_set:
+                    boundary.add(inp.name)
+                else:
+                    frontier.append(inp)
+        return boundary
 
     # ── Step 3: per-tensor cost analysis ───────────────────────────────
     chain_cache: Dict[str, float] = {}
@@ -257,34 +263,215 @@ def select_activations_to_recompute(
 
         enriched.append((name, s, action, cost_ms))
 
-    # ── Step 4: rank by score and greedy fill ──────────────────────────
-    # score = bytes saved per ms paid by chosen option
+    # ── Step 4: rank by score and greedy fill, with re-simulation ───────
+    # μ-TWO doesn't trust a static "peak − size" estimate: dropping an
+    # activation also extends its boundary inputs' lifetimes (they're now
+    # consumed at the recompute splice). Build a real timeline and re-derive
+    # peak after each tentative pick.
     enriched.sort(
         key=lambda e: e[1]["size_bytes"] / max(e[3], 1e-3),
         reverse=True,
     )
 
+    # Build the baseline delta array from current stats. Deltas are indexed
+    # by graph step; +size at first_use, -size at last_use+1. Cumsum gives
+    # live bytes; max gives peak.
+    n_steps = len(idx_of) + 2
+    deltas = np.zeros(n_steps, dtype=np.float64)
+    # Track current effective lifetimes per node so we can update incrementally.
+    eff_life: Dict[str, tuple] = {}
+    for nm, st in stats.items():
+        sz = st.get("size_bytes", 0)
+        if sz <= 0:
+            continue
+        life = st.get("lifetime")
+        if life is None:
+            continue
+        first, last = life
+        deltas[first] += sz
+        deltas[last + 1] -= sz
+        eff_life[nm] = (first, last)
+
+    def _current_peak() -> float:
+        return float(np.max(np.cumsum(deltas[:-1])))
+
+    sim_peak = _current_peak()
+
+    def _alive_at_peak(nm: str) -> bool:
+        st = stats.get(nm)
+        if st is None:
+            return False
+        if st.get("type") == "PARAM":
+            return True   # placeholders span the whole graph
+        life = eff_life.get(nm) or st.get("lifetime")
+        if life is None:
+            return False
+        return life[0] <= peak_step <= life[1]
+
+    def _expand_recompute_set(seed: str, current: set) -> set:
+        """Cascading recompute: starting from `seed`, walk back through
+        boundary inputs that are forward-only (i.e. not alive at peak and
+        not placeholders) and pull them into the recompute set too. The
+        walk bottoms out when every boundary input is either a placeholder,
+        already alive at peak, or already in the set. Returns the *added*
+        names (not including the seed if it was already in `current`)."""
+        added: set = set()
+        worklist = [seed]
+        while worklist:
+            nm = worklist.pop()
+            if nm in current or nm in added:
+                continue
+            node = name_to_node.get(nm)
+            if node is None:
+                continue
+            # Pull this node into the recompute set.
+            added.add(nm)
+            # Examine its raw graph inputs (not the closure).
+            for inp in node.all_input_nodes:
+                if inp.op == "placeholder":
+                    continue
+                if _alive_at_peak(inp.name):
+                    continue   # safe boundary: no lifetime extension at peak
+                if inp.name in current or inp.name in added:
+                    continue
+                # Forward-only boundary input — keep cascading.
+                worklist.append(inp.name)
+        return added
+
+    def _apply_lifetime(nm: str, new_first: int, new_last: int, log: list) -> None:
+        st = stats.get(nm)
+        if st is None:
+            return
+        size = st.get("size_bytes", 0)
+        if size <= 0:
+            return
+        old = eff_life.get(nm, st.get("lifetime"))
+        if old is None:
+            return
+        of, ol = old
+        if (of, ol) == (new_first, new_last):
+            return
+        deltas[of] -= size
+        deltas[ol + 1] += size
+        deltas[new_first] += size
+        deltas[new_last + 1] -= size
+        log.append(("life", nm, old))
+        eff_life[nm] = (new_first, new_last)
+
+    def _try_pick(name: str, s: dict) -> tuple[bool, float, list]:
+        """Cascading-recompute pick. Apply tentatively and re-derive peak;
+        roll back if peak doesn't strictly drop."""
+        node = name_to_node.get(name)
+        if node is None:
+            return False, sim_peak, []
+
+        bwd_users = [idx_of[u] for u in node.users
+                     if u in idx_of and idx_of[u] > sep_idx]
+        if not bwd_users:
+            return False, sim_peak, []
+        recompute_point = min(bwd_users)
+
+        # 1) Decide the full set of nodes that will be recomputed: `name` plus
+        #    every forward-only ancestor reachable through non-peak-alive nodes.
+        current_set = set(nodes_to_recompute)
+        new_acts = _expand_recompute_set(name, current_set)
+        if name not in new_acts:
+            return False, sim_peak, []
+        full_set = current_set | new_acts
+
+        log: list = []
+
+        # 2) Each newly-recomputed activation's lifetime collapses to its own
+        #    forward range (last_use becomes its last fwd user). Its bytes
+        #    disappear from the bwd region; instead, its *boundary inputs* —
+        #    i.e. the nodes the rewriter's BFS bottoms out at — get extended
+        #    to the recompute_point.
+        for nm in new_acts:
+            n_node = name_to_node.get(nm)
+            if n_node is None:
+                continue
+            cur_first, cur_last = eff_life.get(nm, stats[nm]["lifetime"])
+            fwd_uses = [idx_of[u] for u in n_node.users
+                        if u in idx_of and idx_of[u] <= sep_idx]
+            new_last = max(fwd_uses) if fwd_uses else cur_first
+            if new_last < cur_last:
+                _apply_lifetime(nm, cur_first, new_last, log)
+
+        # 3) Now extend boundary inputs of the full set. The rewriter walks
+        #    back through any node in full_set; the first non-set, non-
+        #    placeholder ancestor is the boundary. Those get a use at
+        #    recompute_point.
+        boundary: set = set()
+        seen: set = set()
+        frontier = [name_to_node[nm] for nm in new_acts if nm in name_to_node]
+        while frontier:
+            cur = frontier.pop()
+            for inp in cur.all_input_nodes:
+                if inp.name in seen:
+                    continue
+                seen.add(inp.name)
+                if inp.op == "placeholder" or inp.name not in full_set:
+                    boundary.add(inp.name)
+                else:
+                    frontier.append(inp)
+
+        for inp in boundary:
+            inp_st = stats.get(inp)
+            if inp_st is None:
+                continue
+            if inp_st.get("type") == "PARAM":
+                continue
+            inp_first, inp_last = eff_life.get(inp, inp_st["lifetime"])
+            if recompute_point <= inp_last:
+                continue
+            _apply_lifetime(inp, inp_first, recompute_point, log)
+
+        new_peak = _current_peak()
+        if new_peak >= sim_peak:
+            # Roll back
+            for kind, nm, old in reversed(log):
+                if kind == "life":
+                    cur_first, cur_last = eff_life[nm]
+                    cur_size = stats[nm].get("size_bytes", 0)
+                    deltas[cur_first] -= cur_size
+                    deltas[cur_last + 1] += cur_size
+                    of, ol = old
+                    deltas[of] += cur_size
+                    deltas[ol + 1] -= cur_size
+                    eff_life[nm] = old
+            return False, sim_peak, []
+        # Success: also commit cascaded acts so subsequent picks see them
+        # in nodes_to_recompute.
+        for nm in new_acts:
+            if nm != name and nm not in nodes_to_recompute:
+                nodes_to_recompute.append(nm)
+                schedule[nm] = "RECOMPUTE"
+        return True, new_peak, log
+
     nodes_to_recompute: List[str] = []
     schedule: Dict[str, str] = {name: "RETAIN" for name, *_ in enriched}
-    projected_peak = current_peak_bytes
     swap_count = 0
 
     for name, s, action, cost_ms in enriched:
-        if projected_peak <= target_peak_bytes:
+        if sim_peak <= target_peak_bytes:
             break
         if len(nodes_to_recompute) + swap_count >= max_recompute:
             break
+        if action != "RECOMPUTE":
+            schedule[name] = action
+            swap_count += 1
+            continue
 
+        accepted, new_peak, _log = _try_pick(name, s)
+        if not accepted:
+            continue
         schedule[name] = action
-        projected_peak -= s["size_bytes"]
-        if action == "RECOMPUTE":
-            nodes_to_recompute.append(name)
-        else:
-            swap_count += 1   # advisory; rewriter doesn't implement SWAP yet
+        nodes_to_recompute.append(name)
+        sim_peak = new_peak
 
     print(f"[μ-TWO] {len(nodes_to_recompute)} RECOMPUTE + {swap_count} SWAP "
           f"selected ({current_peak_bytes/1024**2:.1f} MB → "
-          f"{projected_peak/1024**2:.1f} MB, target "
+          f"{sim_peak/1024**2:.1f} MB, target "
           f"{target_peak_bytes/1024**2:.1f} MB)")
     return nodes_to_recompute, schedule
 
@@ -409,25 +596,34 @@ def activation_checkpointing(
     node_idx = _node_indices(gm)
     recompute_set = set(nodes_to_recompute_names)
 
+    # Plan all subgraph extractions against the ORIGINAL graph in one pass.
+    # Doing this on a per-iteration basis after splices breaks: each extracted
+    # subgraph would also pick up the spliced copies from prior iterations,
+    # causing the recompute regions to roughly double in size each step.
+    plans: list[tuple[str, fx.Node, fx.Node, fx.Graph]] = []
     for act_name in nodes_to_recompute_names:
         if act_name not in name_to_node:
             print(f"[AC] skipping '{act_name}' — not in graph")
             continue
         node_to_recompute = name_to_node[act_name]
-
         first_back = _first_backward_user(node_to_recompute, node_idx, sep_idx)
         if first_back is None:
             print(f"[AC] skipping '{act_name}' — no backward user")
             continue
-
         deps = _compute_recompute_inputs(node_to_recompute, recompute_set)
-
-        # Extract a subgraph that recomputes act_name from its boundary inputs
         recompute_subgraph = _extract_subgraph(
             joint_graph=gm.graph,
             inputs=deps,
             outputs=[node_to_recompute],
         )
+        sub_ops = [n for n in recompute_subgraph.nodes
+                   if n.op not in ("placeholder", "output")]
+        sub_phs = [n.name for n in recompute_subgraph.nodes if n.op == "placeholder"]
+        print(f"  [AC] {act_name}: deps={[d.name for d in deps]} "
+              f"placeholders={sub_phs} ops={[n.name for n in sub_ops]}")
+        plans.append((act_name, node_to_recompute, first_back, recompute_subgraph))
+
+    for act_name, node_to_recompute, first_back, recompute_subgraph in plans:
 
         # Splice the recomputation in just before the first backward use
         with gm.graph.inserting_before(first_back):
