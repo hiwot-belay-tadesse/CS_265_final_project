@@ -149,38 +149,66 @@ def select_activations_to_recompute(
                       if _alive_and_useful(n, s["lifetime"])]
         print(f"  [μ-TWO] {len(candidates)} eligible after peak filter")
 
-    # ── Step 2b: shallow-recompute filter. The producer's inputs must each
-    # be either a placeholder OR a node that's still alive at the activation's
-    # first backward use (the recomputation point). If an input is dead by
-    # then, recomputing it would require chaining further back — which our
-    # rewriter can't handle without ballooning memory.
-    def _is_shallow(act_name: str) -> bool:
-        node = name_to_node.get(act_name)
-        if node is None:
+    # ── Step 2b: chain-aware feasibility filter.
+    # Two conditions, tested per candidate via a BFS up the graph:
+    #   1. Boundary reachability — the chain back from the activation must
+    #      terminate at placeholders or at intermediates still alive at the
+    #      recomputation point. If an intermediate is dead by then, our
+    #      rewriter can't recover it.
+    #   2. Peak-shift safety — every intermediate node copied into the
+    #      recompute block has its own brief allocation. If any of those
+    #      intermediates is *bigger* than the activation we're freeing, the
+    #      simulation will find a new peak inside the recompute block that
+    #      exceeds the original peak. So require:
+    #        max(size of any intermediate in the chain) ≤ size of the act.
+    def _chain_feasible(act_name: str) -> bool:
+        target = name_to_node.get(act_name)
+        if target is None:
             return False
-        # Recomputation gets inserted just before the first backward consumer.
+        target_size = stats.get(act_name, {}).get("size_bytes", 0)
+        if target_size <= 0:
+            return False
+
         bwd_user_idxs = [
-            idx_of[u] for u in node.users
+            idx_of[u] for u in target.users
             if u in idx_of and idx_of[u] > sep_idx
         ]
         if not bwd_user_idxs:
             return False
         recompute_point = min(bwd_user_idxs)
 
-        for inp in node.all_input_nodes:
-            if inp.op == "placeholder":
+        # BFS the dependency chain up to placeholders or surviving nodes
+        seen: set = set()
+        frontier: list = [target]
+        while frontier:
+            node = frontier.pop()
+            if node.name in seen:
                 continue
-            # input must still be alive at recompute_point
-            inp_stat = stats.get(inp.name, {})
-            inp_lifetime = inp_stat.get("lifetime")
-            if inp_lifetime is None:
-                return False
-            if not (inp_lifetime[0] <= recompute_point <= inp_lifetime[1]):
-                return False
+            seen.add(node.name)
+
+            # Boundary check
+            if node is target:
+                pass  # always recurse from target
+            else:
+                # If this node is alive at recompute_point, treat as boundary
+                inp_lifetime = stats.get(node.name, {}).get("lifetime")
+                if inp_lifetime is not None and \
+                   inp_lifetime[0] <= recompute_point <= inp_lifetime[1]:
+                    continue
+                # If placeholder, also boundary
+                if node.op == "placeholder":
+                    continue
+                # Otherwise it'd need to be re-executed — peak-shift check
+                inp_size = stats.get(node.name, {}).get("size_bytes", 0)
+                if inp_size > target_size:
+                    return False    # this intermediate is too big
+                # Continue walking back through this node's inputs
+            for prev in node.all_input_nodes:
+                frontier.append(prev)
         return True
 
-    candidates = [(n, s) for n, s in candidates if _is_shallow(n)]
-    print(f"  [μ-TWO] {len(candidates)} eligible after shallow filter")
+    candidates = [(n, s) for n, s in candidates if _chain_feasible(n)]
+    print(f"  [μ-TWO] {len(candidates)} eligible after chain-feasibility filter")
 
     # ── Step 3: per-tensor cost analysis ───────────────────────────────
     chain_cache: Dict[str, float] = {}
