@@ -170,13 +170,23 @@ def make_graph_transformation(
             for _ in range(warm_up_iters):
                 profiler.run(*args)
             profiler.reset_stats()
+            # Reset the CUDA allocator's high-water mark so we measure the
+            # actual peak of just the profile iterations.
+            measured_peak_bytes = 0
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
             for _ in range(profile_iters):
                 profiler.run(*args)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                measured_peak_bytes = torch.cuda.max_memory_allocated()
         profiler.aggregate_stats()
-        return (
-            profiler.training_peak_memory,
-            sum(s["latency_ms"] for s in profiler.stats.values()),
-        )
+        # Prefer the real allocator measurement when available; fall back to
+        # the simulation when running on CPU.
+        peak = measured_peak_bytes if measured_peak_bytes > 0 \
+               else profiler.training_peak_memory
+        latency = sum(s["latency_ms"] for s in profiler.stats.values())
+        return peak, latency
 
     def graph_transformation(gm: fx.GraphModule, args: Any) -> fx.GraphModule:
         """Profile gm, apply AC, profile again, record both passes."""
