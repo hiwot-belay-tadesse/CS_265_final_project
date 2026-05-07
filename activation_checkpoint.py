@@ -82,7 +82,7 @@ def select_activations_to_recompute(
     stats: Dict[str, dict],
     current_peak_bytes: float,
     target_peak_bytes: float,
-    max_recompute: int = 10,
+    max_recompute: int = 50,
     gm: "fx.GraphModule | None" = None,
     peak_step: int | None = None,
     sep_idx: int | None = None,

@@ -62,35 +62,41 @@ class GraphProfiler(fx.Interpreter):
         self.peak_memory = 0.0
         self.peak_step = 0
 
-        # 1 Find the separator node
+        # Single pass over the graph: locate the fwd/bwd separator, the
+        # backward separator (which marks the start of the optimizer phase),
+        # build the node→index map, and classify every node as
+        # PARAM / ACT / OTHER / GRAD relative to the separator.
         self.sep_idx = None
-        sep_node = None
+        sep_node = None ## marks the SEPFunction node that separates forward and backward
+        idx_of: Dict[fx.Node, int] = {}
+        nodes_in_order: list[fx.Node] = []
+        sep_targets: list[str] = []
+
         for i, node in enumerate(self.module.graph.nodes):
-            if node.target == torch.ops.separator.sep.default:
+            idx_of[node] = i
+            nodes_in_order.append(node)
+            target_str = str(node.target)
+            if "separator" in target_str:
+                sep_targets.append(target_str)
+            if sep_node is None and node.target == torch.ops.separator.sep.default:
                 sep_node = node
                 self.sep_idx = i
-                break
-        # Find where the optimizer step begins (first node after the last backward op)
-        self.optim_start_idx = None
-        for i, node in enumerate(self.module.graph.nodes):
-            if "backward" in str(node.target):
-                self.optim_start_idx = i + 1
+            if node.target == torch.ops.separator.sep_backward.default:
+                sep_bwd_idx = i
 
+        # Optimizer phase begins immediately after the SEP-backward marker.
+        # Falls back to None if the marker isn't present.
+        self.optim_start_idx = (sep_bwd_idx + 1) if sep_bwd_idx is not None else None
 
-        ##2 Catagorize the nodes
-        # Build node→index map for crossing-sep checks
-        idx_of = {n: i for i, n in enumerate(self.module.graph.nodes)}
         sep_idx_local = self.sep_idx if self.sep_idx is not None else float("inf")
-
         sep_found = False
-        for node in self.module.graph.nodes:
-            if node == sep_node:
+        for node in nodes_in_order:
+            if node is sep_node:
                 sep_found = True
                 continue
             if node.op == "placeholder":
                 self.node_mapping[node] = NodeType.PARAM
             elif not sep_found:
-                # Only true activations: produced in fwd AND consumed in bwd
                 has_bwd_user = any(
                     idx_of.get(u, -1) > sep_idx_local for u in node.users
                 )
@@ -100,7 +106,6 @@ class GraphProfiler(fx.Interpreter):
             else:
                 self.node_mapping[node] = NodeType.GRAD
 
-        sep_targets = [str(n.target) for n in self.module.graph.nodes if "separator" in str(n.target)]
         print(f"separator targets in graph: {sep_targets}")
     def run(
         self,
